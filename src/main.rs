@@ -213,9 +213,9 @@ fn write_to_file_text(data: &Vec<u8>) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_to_file_bitwise(data: &Vec<u8>) -> std::io::Result<()> {
-    println!("Writing to file...");
-    let mut file = File::create("out/bytes.bin")?;
+fn write_to_binary(data: &Vec<u8>) -> std::io::Result<()> {
+    println!("Writing to binary...");
+    let mut file = File::create("out/out.bin")?;
     let mut byte_counter = 0;
     let mut byte: u8 = 0;
 
@@ -239,6 +239,46 @@ fn write_to_file_bitwise(data: &Vec<u8>) -> std::io::Result<()> {
     Ok(())
 }
 
+fn write_cas_fuji(out_file: &mut File) -> std::io::Result<()> {
+    // The FUJI literal
+    out_file.write_all(&[0x46, 0x55, 0x4a, 0x49])?;
+    // Header metadata for empty FUJI chunk
+    out_file.write_all(&[0x00, 0x00, 0x00, 0x00])?;
+    Ok(())
+}
+
+fn write_cas_baud(out_file: &mut File, baud_rate: u16) -> std::io::Result<()> {
+    // The baud literal
+    out_file.write_all(&[0x62, 0x61, 0x75, 0x64])?;
+    // Zero chunk length
+    out_file.write_all(&[0x00, 0x00])?;
+    // Write baud rate
+    out_file.write_all(&[(baud_rate - baud_rate << 8) as u8, (baud_rate << 8) as u8])?;
+    Ok(())
+}
+
+fn write_cas_data(data: &Vec<u8>, irg_len: u16, out_file: &mut File) -> std::io::Result<()> {
+    let num_bytes: u16 = data.len() as u16;
+    // The data literal
+    out_file.write_all(&[0x64, 0x61, 0x74, 0x61])?;
+    // Chunk length
+    out_file.write_all(&[(num_bytes - num_bytes << 8) as u8, (num_bytes << 8) as u8])?;
+    // IRG length
+    out_file.write_all(&[(irg_len - irg_len << 8) as u8, (irg_len << 8) as u8])?;
+
+    // Bytes
+    for &byte in data.iter() {
+        out_file.write_all(&[byte])?;
+    }
+    Ok(())
+}
+
+fn write_to_cas(data: &Vec<u8>) -> std::io::Result<()> {
+    println!("Writing to cas...");
+    let mut file = File::create("out/out.cas")?;
+    Ok(())
+}
+
 fn process_wav(header: Header, raw_data: BitDepth) {
     print_stats(&header);
     let data: Vec<f32> = to_float_vec(raw_data);
@@ -247,7 +287,7 @@ fn process_wav(header: Header, raw_data: BitDepth) {
     let binary: Vec<u8> = normal_to_raw_binary(&periods, threshold);
     let binary_cut: Vec<u8> = extract_data(binary);
     let data_size: usize = binary_cut.len();
-    match write_to_file_bitwise(&binary_cut) {
+    match write_to_binary(&binary_cut) {
         Ok(_) => {println!("Successfully written {data_size} bits to file!");}
         Err(_) => {print!("ERROR: Writing to file failed!");}
     }
