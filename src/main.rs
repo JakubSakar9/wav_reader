@@ -2,6 +2,7 @@ use std::fs::File;
 use std::path::Path;
 use std::io::Error;
 use std::io::prelude::*;
+use std::process::exit;
 
 use wav::header::Header;
 use wav::bit_depth::BitDepth;
@@ -88,13 +89,14 @@ fn to_float_vec(data: BitDepth) -> Vec<f32> {
     }
 }
 
-fn signal_to_periods(data: Vec<f32>, threshold: f32) -> Vec<u32> {
-    let num_samples: u64 = data.len() as u64;
+fn analyze_signal(data: Vec<f32>, threshold: f32) -> (Vec<u32>, Vec<u32>) {
+    let num_samples: u32 = data.len() as u32;
     let mut num_pulses: u32 = 0;
-    let mut last_max_idx: u64 = 0;
+    let mut last_max_idx: u32 = 0;
     let mut last_max: f32 = 0.0;
     let mut last_sample: f32 = 2.0;
-    let mut result: Vec<u32> = vec![];
+    let mut periods: Vec<u32> = vec![];
+    let mut cum_samples: Vec<u32> = vec![];
     println!("Measuring period lengths in the signal...");
     for i in 0..(num_samples - 1) {
         let x: f32 = data[i as usize];
@@ -104,7 +106,7 @@ fn signal_to_periods(data: Vec<f32>, threshold: f32) -> Vec<u32> {
         }
 
         if x > last_sample {
-            let pulse_length: u64 = i - last_max_idx;
+            let pulse_length: u32 = i - last_max_idx;
             last_max_idx = i;
             if pulse_length < 5 || pulse_length > 50 {
                 last_sample = x;
@@ -120,13 +122,14 @@ fn signal_to_periods(data: Vec<f32>, threshold: f32) -> Vec<u32> {
             }
 
             num_pulses += 1;
-            result.push(pulse_length as u32);
+            periods.push(pulse_length as u32);
+            cum_samples.push(i);
         }
 
         last_sample = x;
     }
     println!("Number of pulses in the signal: {}", num_pulses);
-    return result;
+    return (periods, cum_samples);
 }
 
 fn compute_threshold(periods: &Vec<u32>) -> f32 {
@@ -136,24 +139,31 @@ fn compute_threshold(periods: &Vec<u32>) -> f32 {
     (periods_s[octile] + periods_s[periods.len() - octile]) as f32 / 2.0
 }
 
-fn measure_irg(periods: &Vec<u32>, pulses: Vec<u8>, sample_rate: u32) -> Vec<u16> {
-    let irg_threshold = 10;
+fn measure_irg(pulses: Vec<u8>, sample_rate: u32, cum_samples: Vec<u32>) -> Vec<u16> {
+    let irg_threshold = 100;
     let mut cur_streak: u32 = 0;
-    let mut cur_streak_samples: u32 = 0;
+    let mut last_streak_start: i32 = -1;
     let mut result: Vec<u16> = vec![];
+
     for i in 0..pulses.len() {
         let cur_value: u16 = pulses[i] as u16;
         if cur_value == 1 {
             cur_streak += 1;
-            cur_streak_samples += periods[i];
         }
         else {
             if cur_streak > irg_threshold {
+                let cur_streak_samples: u32;
+                if last_streak_start < 0 {
+                    cur_streak_samples = cum_samples[i];
+                }
+                else {
+                    cur_streak_samples = cum_samples[i] - cum_samples[last_streak_start as usize];
+                }
                 let irg_ms: f32 = cur_streak_samples as f32 * 1000.0 / sample_rate as f32;
                 result.push(irg_ms as u16);
             }
             cur_streak = 0;
-            cur_streak_samples = 0;
+            last_streak_start = i as i32;
         }
         result.push(cur_value);
     }
@@ -168,14 +178,17 @@ fn write_collapsed_data(bit_value: u16, cluster_length: u32, data_vec: &mut Vec<
     let singular_cluster_length: f32 = if bit_value == 0 {6.5} else {8.45};
     let num_bits_f: f32 = cluster_length as f32  / singular_cluster_length;
     let num_bits = (num_bits_f + 0.5) as i32;
+    if num_bits > 10 {
+        return;
+    }
     for _ in 0..num_bits {
         data_vec.push(bit_value);
     }
 }
 
-fn normal_to_raw_binary(periods: &Vec<u32>, threshold: f32, sample_rate: u32) -> Vec<u16> {
+fn normal_to_raw_binary(periods: &Vec<u32>, threshold: f32, sample_rate: u32, cum_samples: Vec<u32>) -> Vec<u16> {
     let pulses: Vec<u8> = periods.iter().map(|a| if *a as f32 > threshold {0} else {1}).collect();
-    let pulses_irg: Vec<u16> = measure_irg(periods, pulses, sample_rate);
+    let pulses_irg: Vec<u16> = measure_irg(pulses, sample_rate, cum_samples);
 
     let mut result: Vec<u16> = vec![];
     let mut cluster_length: u32 = 1;
@@ -204,6 +217,9 @@ fn normal_to_raw_binary(periods: &Vec<u32>, threshold: f32, sample_rate: u32) ->
         last_bit = x;
         cluster_length += 1;
     }
+    for i in 0..256 {
+        print!("{}", result[i]);
+    }
     return result;
 }
 
@@ -223,7 +239,6 @@ fn extract_data(input: Vec<u16>) -> Vec<DataChunk> {
             let mut data_chunk: DataChunk = DataChunk { irg_length: 0, data: vec![]};
             data_chunk.irg_length = cur_irg;
             data_chunk.data = chunk_data.clone();
-            chunk_data.clear();
             output.push(data_chunk);
             byte_counter = 0;
             in_data = false;
@@ -242,7 +257,7 @@ fn extract_data(input: Vec<u16>) -> Vec<DataChunk> {
         } else if bit > 1 {
             in_data = true;
             cur_irg = bit;
-            print!("{cur_irg} ");
+            // print!("{cur_irg} ");
         }        
     }
     output
@@ -323,9 +338,9 @@ fn write_to_cas(data: &Vec<u8>) -> std::io::Result<()> {
 fn process_wav(header: Header, raw_data: BitDepth) {
     print_stats(&header);
     let data: Vec<f32> = to_float_vec(raw_data);
-    let periods: Vec<u32> = signal_to_periods(data, 0.05);
+    let (periods, cum_samples): (Vec<u32>, Vec<u32>) = analyze_signal(data, 0.3);
     let threshold: f32 = compute_threshold(&periods);
-    let binary: Vec<u16> = normal_to_raw_binary(&periods, threshold, header.sampling_rate);
+    let binary: Vec<u16> = normal_to_raw_binary(&periods, threshold, header.sampling_rate, cum_samples);
     let binary_cut: Vec<DataChunk> = extract_data(binary);
     let data_size: usize = binary_cut.len();
     match write_to_binary(&binary_cut) {
