@@ -90,44 +90,76 @@ fn to_float_vec(data: BitDepth) -> Vec<f32> {
 }
 
 fn analyze_signal(data: Vec<f32>, threshold: f32) -> (Vec<u32>, Vec<u32>) {
+    // Analysis init
     let num_samples: u32 = data.len() as u32;
-    let mut num_pulses: u32 = 0;
-    let mut last_max_idx: u32 = 0;
-    let mut last_max: f32 = 0.0;
-    let mut last_sample: f32 = 2.0;
-    let mut periods: Vec<u32> = vec![];
+    let zero_threshold: f32 = 0.03;
+    
+    let mut period_phase: u8 = 0;
+    let mut cur_period_streak: u32 = 0;
+    let mut last_period_start: u32 = 0;
+    let mut last_sample: f32 = 0.0;
+    let mut last_min: f32 = 2.0;
+    let mut last_max: f32 = -2.0;
+    
+    // Contains pulse lengths in samples
+    let mut periods = vec![];
+    // Contains number of samples before each detected pulse
     let mut cum_samples: Vec<u32> = vec![];
+
     println!("Measuring period lengths in the signal...");
-    for i in 0..(num_samples - 1) {
+    for i in 0..num_samples {
         let x: f32 = data[i as usize];
-        if i == 0 {
-            last_max_idx = 0;
-            last_max = x;
+
+        // Check period start
+        if last_sample < zero_threshold && x > zero_threshold {
+            if period_phase == 2 {
+                // Process previous period
+                let mut valid_period = cur_period_streak > 3 && cur_period_streak < 100;
+                valid_period &= (last_max - last_min) > threshold;
+                if valid_period {
+                    cum_samples.push(last_period_start);
+                    periods.push(cur_period_streak);
+                } 
+            }
+            period_phase = 1;
+            cur_period_streak = 1;
+            last_period_start = i;
+            last_min = 0.0;
+            last_max = 0.0;
         }
 
-        if x > last_sample {
-            let pulse_length: u32 = i - last_max_idx;
-            last_max_idx = i;
-            if pulse_length < 5 || pulse_length > 50 {
-                last_sample = x;
-                last_max = x;
-                continue;
+        // Check period mid
+        if last_sample > -zero_threshold && x < -zero_threshold {
+            if period_phase != 1 {
+                cur_period_streak = 0;
+                period_phase = 0;
             }
+            else {
+                period_phase = 2;
+            }
+        }
 
-            let sample_diff = last_max - x;
+        // Check silence
+        if last_sample.abs() < zero_threshold && x.abs() < zero_threshold {
+            cur_period_streak = 0;
+            period_phase = 0;
+        }
+
+        // Detect extrema
+        if period_phase == 1 && last_sample < x {
             last_max = x;
-            if sample_diff < threshold {
-                last_sample = x;
-                continue;
-            }
+        }
+        if period_phase == 2 && last_sample > x {
+            last_min = x;
+        }
 
-            num_pulses += 1;
-            periods.push(pulse_length as u32);
-            cum_samples.push(i);
+        if period_phase != 0 {
+            cur_period_streak += 1;
         }
 
         last_sample = x;
     }
+    let num_pulses: usize = periods.len();
     println!("Number of pulses in the signal: {}", num_pulses);
     return (periods, cum_samples);
 }
@@ -140,8 +172,11 @@ fn compute_threshold(periods: &Vec<u32>) -> f32 {
 }
 
 fn measure_irg(pulses: Vec<u8>, sample_rate: u32, cum_samples: Vec<u32>) -> Vec<u16> {
-    let irg_threshold = 100;
+    // Lowest number of samples that are required for a sequence of 1s to be considered an IRG
+    let irg_threshold: u32 = 100;
     let mut cur_streak: u32 = 0;
+    // Measures number of subsequent ones before detecting a one in the signal to filter out errors
+    let mut irg_break_streak: u32 = 0;
     let mut last_streak_start: i32 = -1;
     let mut result: Vec<u16> = vec![];
 
@@ -149,8 +184,13 @@ fn measure_irg(pulses: Vec<u8>, sample_rate: u32, cum_samples: Vec<u32>) -> Vec<
         let cur_value: u16 = pulses[i] as u16;
         if cur_value == 1 {
             cur_streak += 1;
+            irg_break_streak = 0;
+        }
+        else if irg_break_streak < 4 {
+            irg_break_streak += 1;
         }
         else {
+            irg_break_streak = 0;
             if cur_streak > irg_threshold {
                 let cur_streak_samples: u32;
                 if last_streak_start < 0 {
@@ -217,9 +257,6 @@ fn normal_to_raw_binary(periods: &Vec<u32>, threshold: f32, sample_rate: u32, cu
         last_bit = x;
         cluster_length += 1;
     }
-    for i in 0..256 {
-        print!("{}", result[i]);
-    }
     return result;
 }
 
@@ -257,7 +294,6 @@ fn extract_data(input: Vec<u16>) -> Vec<DataChunk> {
         } else if bit > 1 {
             in_data = true;
             cur_irg = bit;
-            // print!("{cur_irg} ");
         }        
     }
     output
@@ -273,7 +309,7 @@ fn write_to_binary(data: &Vec<DataChunk>) -> std::io::Result<()> {
 
         let chunk_data: &Vec<u8> = &chunk.data;
         let irg_length: u16 = chunk.irg_length;
-        file.write_all(&[(irg_length - irg_length << 8) as u8, (irg_length << 8) as u8])?;
+        file.write_all(&[(irg_length - ((irg_length >> 8) << 8)) as u8, (irg_length >> 8) as u8])?;
         for &bit in chunk_data.iter() {
             byte <<= 1;
             byte |= bit;
@@ -340,6 +376,7 @@ fn process_wav(header: Header, raw_data: BitDepth) {
     let data: Vec<f32> = to_float_vec(raw_data);
     let (periods, cum_samples): (Vec<u32>, Vec<u32>) = analyze_signal(data, 0.3);
     let threshold: f32 = compute_threshold(&periods);
+    println!("{threshold}");
     let binary: Vec<u16> = normal_to_raw_binary(&periods, threshold, header.sampling_rate, cum_samples);
     let binary_cut: Vec<DataChunk> = extract_data(binary);
     let data_size: usize = binary_cut.len();
